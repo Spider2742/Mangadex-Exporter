@@ -40,19 +40,23 @@ class API:
         self.session = req_lib.Session()
         self.access_token = self.refresh_token = None
         self.client_id = self.client_secret = None
+        self._username = self._password = None
         self.expires_at = None
+        self._rate_delay = 0.25
 
     def auth(self, cid, csec, user, pwd):
         self.client_id, self.client_secret = cid, csec
+        self._username, self._password = user, pwd
         payload = dict(grant_type="password", username=user, password=pwd,
                        client_id=cid, client_secret=csec)
-        for _ in range(MAX_RETRY):
+        for attempt in range(MAX_RETRY):
             try:
                 r = self.session.post(AUTH_URL, data=payload, timeout=20)
                 if r.status_code == 200:
                     self._store(r.json()); return True
                 return False
-            except Exception: time.sleep(2)
+            except Exception:
+                if attempt < MAX_RETRY-1: time.sleep(2)
         return False
 
     def _store(self, d):
@@ -63,12 +67,23 @@ class API:
 
     def _ensure(self):
         if self.expires_at and datetime.now() >= self.expires_at:
+            # Try refresh token first
             try:
                 r = self.session.post(AUTH_URL, timeout=20, data=dict(
                     grant_type="refresh_token", refresh_token=self.refresh_token,
                     client_id=self.client_id, client_secret=self.client_secret))
-                if r.status_code == 200: self._store(r.json())
+                if r.status_code == 200:
+                    self._store(r.json()); return
             except Exception: pass
+            # Refresh failed — try re-auth with stored credentials
+            if self._username and self._password:
+                try:
+                    r = self.session.post(AUTH_URL, timeout=20, data=dict(
+                        grant_type="password", username=self._username,
+                        password=self._password, client_id=self.client_id,
+                        client_secret=self.client_secret))
+                    if r.status_code == 200: self._store(r.json())
+                except Exception: pass
 
     def get(self, url, params=None):
         self._ensure()
@@ -77,7 +92,9 @@ class API:
                 r = self.session.get(url, params=params, timeout=30)
                 if r.status_code == 200: return r.json()
                 if r.status_code == 429:
-                    time.sleep(int(r.headers.get("Retry-After",5)))
+                    wait = int(r.headers.get("Retry-After", 5))
+                    self._rate_delay = min(self._rate_delay * 2, 5.0)
+                    time.sleep(wait)
                 elif attempt < MAX_RETRY-1: time.sleep(2)
             except Exception:
                 if attempt < MAX_RETRY-1: time.sleep(2)
@@ -93,11 +110,12 @@ class API:
     def manga_details(self, ids, cb=None):
         out, bs = {}, 100
         for i, batch in enumerate([ids[j:j+bs] for j in range(0,len(ids),bs)]):
-            d = self.get(f"{API_BASE}/manga", {"ids[]":batch,"limit":100,"includes[]":["author"]})
+            d = self.get(f"{API_BASE}/manga", {"ids[]":batch,"limit":100,"includes[]":["author"],
+                "contentRating[]":["safe","suggestive","erotica","pornographic"]})
             if d:
                 for m in d.get("data",[]): out[m["id"]] = m
             if cb: cb(min((i+1)*bs,len(ids)), len(ids))
-            time.sleep(0.25)
+            time.sleep(self._rate_delay)
         return out
 
     def read_chapters(self, ids):
@@ -105,17 +123,18 @@ class API:
         for batch in [ids[i:i+bs] for i in range(0,len(ids),bs)]:
             d = self.get(f"{API_BASE}/manga/read", {"ids[]":batch,"grouped":"true"})
             if d: out.update(d.get("data",{}))
-            time.sleep(0.25)
+            time.sleep(self._rate_delay)
         return out
 
     def chapter_details(self, ids, cb=None):
         out, bs = {}, 100
         for i, batch in enumerate([ids[j:j+bs] for j in range(0,len(ids),bs)]):
-            d = self.get(f"{API_BASE}/chapter", {"ids[]":batch,"limit":100})
+            d = self.get(f"{API_BASE}/chapter", {"ids[]":batch,"limit":100,
+                "contentRating[]":["safe","suggestive","erotica","pornographic"]})
             if d:
                 for ch in d.get("data",[]): out[ch["id"]] = ch
             if cb: cb(min((i+1)*bs,len(ids)), len(ids))
-            time.sleep(0.25)
+            time.sleep(self._rate_delay)
         return out
 
     def ratings(self, ids):
@@ -123,9 +142,11 @@ class API:
         for batch in [ids[i:i+bs] for i in range(0,len(ids),bs)]:
             d = self.get(f"{API_BASE}/rating", {"manga[]":batch})
             if d:
-                for mid, rd in d.get("ratings",{}).items():
-                    out[mid] = rd.get("rating",0)
-            time.sleep(0.25)
+                ratings_data = d.get("ratings") or {}
+                if isinstance(ratings_data, dict):
+                    for mid, rd in ratings_data.items():
+                        out[mid] = rd.get("rating",0)
+            time.sleep(self._rate_delay)
         return out
 
     def put(self, url, body):
@@ -205,7 +226,16 @@ class API:
 
     def find_by_mal_id(self, mal_id):
         """Search MangaDex for a manga by its MAL ID. Returns MangaDex UUID or None."""
-        d = self.get(f"{API_BASE}/manga", {"links[mal]": str(mal_id), "limit": 1})
+        d = self.get(f"{API_BASE}/manga", {"links[mal]": str(mal_id), "limit": 1,
+            "contentRating[]":["safe","suggestive","erotica","pornographic"]})
+        if d and d.get("data"):
+            return d["data"][0]["id"]
+        return None
+
+    def find_by_al_id(self, al_id):
+        """Search MangaDex for a manga by its AniList ID. Returns MangaDex UUID or None."""
+        d = self.get(f"{API_BASE}/manga", {"links[al]": str(al_id), "limit": 1,
+            "contentRating[]":["safe","suggestive","erotica","pornographic"]})
         if d and d.get("data"):
             return d["data"][0]["id"]
         return None
@@ -243,15 +273,25 @@ def _clear_checkpoint():
     try: os.remove(_checkpoint_file)
     except Exception: pass
 
+def _xml_escape(s):
+    """Escape special XML characters in text content."""
+    return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
+
+def _cdata(s):
+    """Wrap text in CDATA, safely handling ]]> sequences."""
+    return f'<![CDATA[{str(s).replace("]]>", "]]]]><![CDATA[>")}]]>'
+
 def _write_xml(entries, path, uid, uname, gz=False):
     with_id = [e for e in entries if e.get("mal_id")]
     counts = defaultdict(int)
     for e in with_id: counts[e["mal_status"]] += 1
+    safe_uid = _xml_escape(uid)
+    safe_uname = _xml_escape(uname)
     lines = [
         '<?xml version="1.0" encoding="UTF-8" ?>',
         '<myanimelist>','<myinfo>',
-        f'  <user_id>{uid}</user_id>',
-        f'  <user_name>{uname}</user_name>',
+        f'  <user_id>{safe_uid}</user_id>',
+        f'  <user_name>{safe_uname}</user_name>',
         '  <user_export_type>2</user_export_type>',
         f'  <user_total_manga>{len(with_id)}</user_total_manga>',
         f'  <user_total_reading>{counts["Reading"]}</user_total_reading>',
@@ -265,7 +305,7 @@ def _write_xml(entries, path, uid, uname, gz=False):
         times = "1" if e["mal_status"]=="Completed" else "0"
         lines += ['<manga>',
             f'  <manga_mangadb_id>{e["mal_id"]}</manga_mangadb_id>',
-            f'  <manga_title><![CDATA[{e["title"]}]]></manga_title>',
+            f'  <manga_title>{_cdata(e["title"])}</manga_title>',
             f'  <my_read_volumes>{e.get("volume",0)}</my_read_volumes>',
             f'  <my_read_chapters>{e.get("chapter",0)}</my_read_chapters>',
             '  <my_start_date>0000-00-00</my_start_date>',
@@ -284,6 +324,20 @@ def _write_xml(entries, path, uid, uname, gz=False):
         with open(path,"rb") as fi, gzip.open(path+".gz","wb") as fo:
             fo.write(fi.read())
 
+def _write_kitsu_json(entries, path):
+    """Write Kitsu-compatible JSON export with Kitsu IDs."""
+    kitsu_entries = [e for e in entries if e.get("kitsu_id")]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(kitsu_entries, f, indent=2, ensure_ascii=False)
+    return len(kitsu_entries)
+
+def _write_mu_json(entries, path):
+    """Write MangaUpdates-compatible JSON export with MU IDs."""
+    mu_entries = [e for e in entries if e.get("mu_id")]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(mu_entries, f, indent=2, ensure_ascii=False)
+    return len(mu_entries)
+
 def _guess_status(path):
     n = os.path.basename(path).lower()
     if "re_reading" in n or "re-reading" in n: return "Reading"
@@ -299,6 +353,7 @@ def _run_export(params, resume_cp=None):
     _state["running"] = True
     _state["stop"].clear()
     _state["skipped"] = []
+    all_skipped_entries = []
     api = API()
     _state["api"] = api
 
@@ -321,6 +376,7 @@ def _run_export(params, resume_cp=None):
         if target: all_st = {target: all_st.get(target,[])}
 
         done_list = resume_cp.get("completed",[]) if resume_cp else []
+        done_ids  = set(resume_cp.get("processed_ids",[])) if resume_cp else set()
         total = sum(len(v) for v in all_st.values())
         _log(f"Found {total} manga across {len(all_st)} status group(s)")
 
@@ -337,6 +393,8 @@ def _run_export(params, resume_cp=None):
         _log(f"✓ {len(ratings)} ratings found")
 
         exported_files, start = [], datetime.now()
+        global_done = sum(len(v) for s,v in all_st.items() if s in done_list)
+        summary_counts = defaultdict(int)
 
         for status, manga_ids in all_st.items():
             if _state["stop"].is_set():
@@ -345,16 +403,20 @@ def _run_export(params, resume_cp=None):
                 _log(f"Skipping '{status}' (already done)", "info"); continue
             if not manga_ids: continue
 
-            _log(f"── {status.upper()} ({len(manga_ids)} manga) ──", "info")
-            _prog(0, f"Processing {status}…")
+            group_size = len(manga_ids)
+            _log(f"── {status.upper()} ({group_size} manga) ──", "info")
+            _prog(global_done/total*100 if total else 0, f"Processing {status}…")
 
             # Manga details
             t0 = datetime.now()
-            def det_cb(done, total, _t0=t0):
-                pct = done/total * (60 if mode=="deep" else 85)
+            def det_cb(done, tot, _t0=t0, _gd=global_done, _gs=group_size, _total=total):
+                if not tot or not _total:
+                    _prog(0, f"Fetching details {done}/{tot}"); return
+                local_pct = done/tot
+                overall_pct = (_gd + local_pct * _gs) / _total * 100
                 elapsed = (datetime.now()-_t0).total_seconds()
-                eta = f"{int((elapsed/done)*(total-done)//60)}m {int((elapsed/done)*(total-done)%60)}s" if done else ""
-                _prog(pct, f"Fetching details {done}/{total}", eta)
+                eta = f"{int((elapsed/done)*(tot-done)//60)}m {int((elapsed/done)*(tot-done)%60)}s" if done else ""
+                _prog(overall_pct, f"Fetching details {done}/{tot}", eta)
 
             details = api.manga_details(manga_ids, det_cb)
             _log(f"✓ {len(details)} manga details fetched")
@@ -363,13 +425,15 @@ def _run_export(params, resume_cp=None):
             read_map = {}
             if mode == "deep":
                 _log("Fetching read chapter IDs…", "info")
-                _prog(60, "Fetching read chapters…")
+                deep_base = (global_done / total * 100) if total else 0
+                deep_range = (group_size / total * 100) if total else 0
+                _prog(deep_base + deep_range * 0.6, "Fetching read chapters…")
                 ch_by_manga = api.read_chapters(manga_ids)
                 all_ch = list({cid for ids in ch_by_manga.values() for cid in ids})
                 _log(f"Fetching details for {len(all_ch)} chapters…")
 
-                def ch_cb(done, total):
-                    _prog(60+done/total*30, f"Chapters {done}/{total}")
+                def ch_cb(done, total_ch, _db=deep_base, _dr=deep_range):
+                    _prog(_db + _dr * (0.6 + done/total_ch*0.3) if total_ch else _db, f"Chapters {done}/{total_ch}")
 
                 ch_det = api.chapter_details(all_ch, ch_cb)
                 for mid, cids in ch_by_manga.items():
@@ -384,7 +448,7 @@ def _run_export(params, resume_cp=None):
                     read_map[mid] = (best_ch, best_vol)
 
             # Build entries
-            entries, skipped = [], []
+            entries, skipped, skipped_entries = [], [], []
             for mid, manga in details.items():
                 attrs  = manga.get("attributes",{})
                 titles = attrs.get("title",{})
@@ -394,18 +458,28 @@ def _run_export(params, resume_cp=None):
                 mal_id = links.get("mal")
                 ch, vol = read_map.get(mid,(0,0)) if mode=="deep" else (0,0)
                 score  = ratings.get(mid,0)
-                entries.append(dict(manga_id=mid, title=title, status=status,
+                entry = dict(manga_id=mid, title=title, status=status,
                     mal_status=MAL_MAP.get(status,"Reading"), mal_id=mal_id,
-                    anilist_id=links.get("al"), chapter=int(ch), volume=int(vol), score=score))
-                if not mal_id: skipped.append(title)
+                    anilist_id=links.get("al"), kitsu_id=links.get("kt"),
+                    mu_id=links.get("mu"),
+                    chapter=int(ch), volume=int(vol), score=score,
+                    mangadex_url=f"https://mangadex.org/title/{mid}")
+                entries.append(entry)
+                if not mal_id:
+                    skipped.append(title)
+                    skipped_entries.append(entry)
+                done_ids.add(mid)
 
+            summary_counts[status] = len(entries)
             if skipped:
                 _log(f"⚠ {len(skipped)} manga have no MAL ID", "warning")
                 _state["skipped"].extend(skipped)
+                all_skipped_entries.extend(skipped_entries)
 
             if dry_run:
                 _log(f"[DRY RUN] Would save {len(entries)} entries for '{status}'","warning")
                 done_list.append(status)
+                global_done += group_size
                 continue
 
             ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -436,17 +510,50 @@ def _run_export(params, resume_cp=None):
                 _write_xml(entries, ap, uid, uname, gz=False)
                 out.append(ap); _log(f"✓ AniList XML saved: {os.path.basename(ap)}", "success")
 
+            # Kitsu JSON
+            if params.get("fmt_kitsu"):
+                kp = os.path.join(save_dir, f"kitsu_{status}_{ts_str}.json")
+                kn = _write_kitsu_json(entries, kp)
+                out.append(kp); _log(f"✓ Kitsu JSON saved: {os.path.basename(kp)} ({kn} with Kitsu ID)", "success")
+
+            # MangaUpdates JSON
+            if params.get("fmt_mu"):
+                mup = os.path.join(save_dir, f"mangaupdates_{status}_{ts_str}.json")
+                mun = _write_mu_json(entries, mup)
+                out.append(mup); _log(f"✓ MangaUpdates JSON saved: {os.path.basename(mup)} ({mun} with MU ID)", "success")
+
             done_list.append(status)
-            _save_checkpoint({"completed":done_list,"timestamp":datetime.now().isoformat()})
-            _prog(100, f"✓ '{status}' done")
+            global_done += group_size
+            _save_checkpoint({"completed":done_list,"processed_ids":list(done_ids),
+                              "timestamp":datetime.now().isoformat()})
+            _prog(global_done/total*100 if total else 100, f"✓ '{status}' done")
 
         if not _state["stop"].is_set():
+            # Save skipped (no MAL ID) entries as JSON if any
+            if all_skipped_entries and not dry_run:
+                skip_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                skip_path = os.path.join(save_dir, f"mdex_no_mal_id_{skip_ts}.json")
+                with open(skip_path, "w", encoding="utf-8") as sf:
+                    json.dump(all_skipped_entries, sf, indent=2, ensure_ascii=False)
+                exported_files.append(skip_path)
+                _log(f"✓ {len(all_skipped_entries)} titles with no MAL ID saved: {os.path.basename(skip_path)}", "success")
+
             _clear_checkpoint()
             _state["exported"] = [f for f in exported_files if f.endswith(".xlsx")]
             elapsed = int((datetime.now()-start).total_seconds())
+
+            # Summary log
+            _log("── EXPORT SUMMARY ──", "info")
+            total_exported = sum(summary_counts.values())
+            for st, cnt in summary_counts.items():
+                _log(f"  {st}: {cnt} manga", "info")
+            _log(f"  Total exported: {total_exported} | Skipped (no MAL ID): {len(all_skipped_entries)}", "info")
+            _log(f"  Files: {len(exported_files)} | Time: {elapsed}s", "info")
+
             _save_history({"date":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "type": target or "Full Library",
-                "total": total, "mode": mode,
+                "total": total_exported, "skipped": len(all_skipped_entries),
+                "mode": mode,
                 "files": ", ".join(os.path.basename(f) for f in exported_files),
                 "elapsed": f"{elapsed}s"})
             _log(f"✓ Export complete in {elapsed}s! {len(exported_files)} file(s) saved.", "success")
@@ -533,6 +640,10 @@ def _run_import(params):
                 mdex_id = entry.get("manga_id")
                 mdex_status = entry.get("status")
                 score = entry.get("score", 0)
+                # Fallback: try AniList ID if no manga_id
+                if not mdex_id and entry.get("anilist_id"):
+                    mdex_id = api.find_by_al_id(entry["anilist_id"])
+                    time.sleep(0.3)
             else:
                 # XML — need to look up MangaDex UUID from MAL ID
                 mal_id = entry.get("mal_id")
@@ -542,6 +653,12 @@ def _run_import(params):
 
                 _log(f"Looking up '{title}' (MAL #{mal_id})…", "info")
                 mdex_id = api.find_by_mal_id(mal_id)
+                if not mdex_id:
+                    # Try AniList ID as fallback
+                    al_id = entry.get("anilist_id")
+                    if al_id:
+                        _log(f"  MAL lookup failed, trying AniList #{al_id}…", "info")
+                        mdex_id = api.find_by_al_id(al_id)
                 time.sleep(0.3)  # be nice to the API
 
             if not mdex_id:
@@ -600,12 +717,15 @@ def index():
 @app.route("/api/stream")
 def stream():
     def gen():
-        while True:
-            try:
-                msg = _state["log_queue"].get(timeout=0.5)
-                yield f"data: {msg}\n\n"
-            except queue.Empty:
-                yield f"data: {json.dumps({'ping':1})}\n\n"
+        try:
+            while True:
+                try:
+                    msg = _state["log_queue"].get(timeout=0.5)
+                    yield f"data: {msg}\n\n"
+                except queue.Empty:
+                    yield f"data: {json.dumps({'ping':1})}\n\n"
+        except GeneratorExit:
+            pass  # Client disconnected — clean up
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
@@ -652,6 +772,12 @@ def history():
             with open(_history_file) as f: return jsonify(json.load(f))
         except Exception: pass
     return jsonify([])
+
+@app.route("/api/history/clear", methods=["POST"])
+def clear_history():
+    try: os.remove(_history_file)
+    except Exception: pass
+    return jsonify(ok=True)
 
 @app.route("/api/checkpoint")
 def checkpoint():
@@ -1409,7 +1535,10 @@ tr:hover td { background: rgba(37,40,64,.5); }
       <div class="card">
         <div class="card-title" style="justify-content:space-between">
           📋 Export History
-          <button class="btn btn-xs" onclick="loadHistory()">🔄 Refresh</button>
+          <span style="display:flex;gap:6px">
+            <button class="btn btn-xs" onclick="loadHistory()">🔄 Refresh</button>
+            <button class="btn btn-xs btn-danger" onclick="clearHistory()">🗑️ Clear</button>
+          </span>
         </div>
         <div class="table-wrap">
           <table>
@@ -1800,6 +1929,13 @@ async function loadHistory() {
     <td style="color:var(--muted)">${e.elapsed||''}</td>
     <td style="font-family:var(--mono);font-size:10px;color:var(--muted)">${(e.files||'').substring(0,60)}${(e.files||'').length>60?'…':''}</td>
   </tr>`).join('');
+}
+
+async function clearHistory() {
+  if (!confirm('Clear all export history?')) return;
+  await fetch('/api/history/clear', {method:'POST'});
+  toast('History cleared.', 'ok');
+  loadHistory();
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
